@@ -12,24 +12,47 @@ use aya::{
     maps::{HashMap as BpfHashMap, RingBuf},
     programs::TracePoint,
 };
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use log::debug;
-use peekbeam_common::{EventKind, SyscallEvent};
+use peekbeam_common::{EventKind, NetEvent, NetEventKind, SyscallEvent, TCP_CLOSE};
 
+mod container;
+mod net_table;
 mod syscall_table;
 mod tui;
 
-/// Live, low-overhead syscall visibility for a single PID (Phase 1).
+/// Live, low-overhead syscall visibility for one target: a PID or a container.
 #[derive(Parser)]
 #[command(name = "peekbeam", version, about)]
+#[command(group(ArgGroup::new("target").required(true).args(["pid", "container"])))]
 struct Args {
     /// PID to trace.
     #[arg(long)]
-    pid: u32,
+    pid: Option<u32>,
+
+    /// Container ID or name to trace (Docker only, cgroup v2 hosts only).
+    #[arg(long)]
+    container: Option<String>,
 
     /// TUI refresh interval, in milliseconds.
     #[arg(long, default_value_t = 1000)]
     refresh_ms: u64,
+}
+
+enum Target {
+    Pid(u32),
+    Container(container::ContainerTarget),
+}
+
+impl Target {
+    fn label(&self) -> String {
+        match self {
+            Target::Pid(pid) => format!("PID {pid}"),
+            Target::Container(c) => {
+                format!("container {} (cgroup {})", &c.full_id[..12.min(c.full_id.len())], c.cgroup_id)
+            }
+        }
+    }
 }
 
 /// Aggregated stats for one syscall number, matched from enter/exit event pairs.
@@ -50,6 +73,26 @@ impl SyscallStats {
 }
 
 pub type StatsMap = Rc<RefCell<HashMap<u64, SyscallStats>>>;
+
+/// Identifies one TCP connection by its 4-tuple (FR3.3). IPv4 addresses are
+/// stored in the first 4 bytes of `saddr`/`daddr`, matching `NetEvent`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnectionKey {
+    pub family: u16,
+    pub sport: u16,
+    pub dport: u16,
+    pub saddr: [u8; 16],
+    pub daddr: [u8; 16],
+}
+
+/// Aggregated state for one connection (FR3.3/FR3.4).
+#[derive(Default, Clone, Copy)]
+pub struct ConnectionStats {
+    pub state: u16,
+    pub retransmits: u64,
+}
+
+pub type ConnMap = Rc<RefCell<HashMap<ConnectionKey, ConnectionStats>>>;
 
 /// FR8.1: fail with an actionable message instead of a raw kernel error when the
 /// process lacks the privileges eBPF loading/attaching requires.
@@ -97,8 +140,16 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
+    let target = if let Some(pid) = args.pid {
+        check_target_exists(pid)?;
+        Target::Pid(pid)
+    } else if let Some(container_id) = args.container.as_deref() {
+        Target::Container(container::resolve(container_id)?)
+    } else {
+        unreachable!("clap requires exactly one of --pid/--container")
+    };
+
     check_privileges()?;
-    check_target_exists(args.pid)?;
     raise_memlock_rlimit();
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -107,26 +158,46 @@ fn main() -> anyhow::Result<()> {
     )))
     .context("loading eBPF bytecode")?;
 
-    let mut pid_filter: BpfHashMap<_, u32, u8> = BpfHashMap::try_from(
-        ebpf.map_mut("PID_FILTER")
-            .context("PID_FILTER map not found in eBPF object")?,
-    )?;
-    pid_filter.insert(args.pid, 1u8, 0)?;
+    match &target {
+        Target::Pid(pid) => {
+            let mut pid_filter: BpfHashMap<_, u32, u8> = BpfHashMap::try_from(
+                ebpf.map_mut("PID_FILTER")
+                    .context("PID_FILTER map not found in eBPF object")?,
+            )?;
+            pid_filter.insert(*pid, 1u8, 0)?;
+        }
+        Target::Container(c) => {
+            let mut cgroup_filter: BpfHashMap<_, u64, u8> = BpfHashMap::try_from(
+                ebpf.map_mut("CGROUP_FILTER")
+                    .context("CGROUP_FILTER map not found in eBPF object")?,
+            )?;
+            cgroup_filter.insert(c.cgroup_id, 1u8, 0)?;
+        }
+    }
 
-    for prog_name in ["sys_enter", "sys_exit"] {
+    for (category, prog_name) in [
+        ("raw_syscalls", "sys_enter"),
+        ("raw_syscalls", "sys_exit"),
+        ("sock", "inet_sock_set_state"),
+        ("tcp", "tcp_retransmit_skb"),
+    ] {
         let program: &mut TracePoint = ebpf
             .program_mut(prog_name)
             .with_context(|| format!("program `{prog_name}` not found in eBPF object"))?
             .try_into()?;
         program.load()?;
         program
-            .attach("raw_syscalls", prog_name)
-            .with_context(|| format!("attaching raw_syscalls:{prog_name}"))?;
+            .attach(category, prog_name)
+            .with_context(|| format!("attaching {category}:{prog_name}"))?;
     }
 
     let mut ring_buf = RingBuf::try_from(
-        ebpf.map_mut("EVENTS")
+        ebpf.take_map("EVENTS")
             .context("EVENTS map not found in eBPF object")?,
+    )?;
+    let mut net_ring_buf = RingBuf::try_from(
+        ebpf.take_map("NET_EVENTS")
+            .context("NET_EVENTS map not found in eBPF object")?,
     )?;
 
     let stats: StatsMap = Rc::new(RefCell::new(HashMap::new()));
@@ -135,7 +206,7 @@ fn main() -> anyhow::Result<()> {
     let mut pending: HashMap<(u32, u64), u64> = HashMap::new();
 
     let stats_for_drain = stats.clone();
-    let drain_events = move || {
+    let mut drain_syscalls = move || {
         while let Some(item) = ring_buf.next() {
             if item.len() != size_of::<SyscallEvent>() {
                 continue;
@@ -161,5 +232,51 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    tui::run(args.pid, Duration::from_millis(args.refresh_ms), stats, drain_events)
+    let connections: ConnMap = Rc::new(RefCell::new(HashMap::new()));
+    let connections_for_drain = connections.clone();
+    let mut drain_net_events = move || {
+        while let Some(item) = net_ring_buf.next() {
+            if item.len() != size_of::<NetEvent>() {
+                continue;
+            }
+            // SAFETY: peekbeam-ebpf only ever writes `NetEvent`-sized records to
+            // this ring buffer, and the kernel guarantees 8-byte aligned reservations,
+            // matching `NetEvent`'s alignment.
+            let event = unsafe { item.as_ptr().cast::<NetEvent>().read_unaligned() };
+            let key = ConnectionKey {
+                family: event.family,
+                sport: event.sport,
+                dport: event.dport,
+                saddr: event.saddr,
+                daddr: event.daddr,
+            };
+            let mut connections = connections_for_drain.borrow_mut();
+            match event.kind {
+                NetEventKind::StateChange if event.state == TCP_CLOSE => {
+                    connections.remove(&key);
+                }
+                NetEventKind::StateChange => {
+                    connections.entry(key).or_default().state = event.state;
+                }
+                NetEventKind::Retransmit => {
+                    let entry = connections.entry(key).or_default();
+                    entry.state = event.state;
+                    entry.retransmits += 1;
+                }
+            }
+        }
+    };
+
+    let poll_events = move || {
+        drain_syscalls();
+        drain_net_events();
+    };
+
+    tui::run(
+        target.label(),
+        Duration::from_millis(args.refresh_ms),
+        stats,
+        connections,
+        poll_events,
+    )
 }
