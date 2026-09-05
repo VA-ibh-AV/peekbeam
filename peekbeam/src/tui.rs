@@ -16,12 +16,13 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
-use crate::{ConnMap, ConnectionKey, ConnectionStats, StatsMap, net_table, syscall_table};
+use crate::{ConnMap, ConnectionKey, ConnectionStats, StatsMap, mem_stats, net_table, syscall_table};
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Syscalls,
     Network,
+    Memory,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -38,6 +39,7 @@ enum SortBy {
 /// no eBPF probes are left attached to a hung terminal session.
 pub fn run(
     target: String,
+    cgroup_path: Option<String>,
     refresh: Duration,
     stats: StatsMap,
     connections: ConnMap,
@@ -49,7 +51,15 @@ pub fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &target, refresh, stats, connections, &mut poll_events);
+    let result = run_loop(
+        &mut terminal,
+        &target,
+        cgroup_path.as_deref(),
+        refresh,
+        stats,
+        connections,
+        &mut poll_events,
+    );
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -61,6 +71,7 @@ pub fn run(
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     target: &str,
+    cgroup_path: Option<&str>,
     refresh: Duration,
     stats: StatsMap,
     connections: ConnMap,
@@ -83,7 +94,8 @@ fn run_loop(
                         KeyCode::Tab => {
                             view = match view {
                                 View::Syscalls => View::Network,
-                                View::Network => View::Syscalls,
+                                View::Network => View::Memory,
+                                View::Memory => View::Syscalls,
                             };
                         }
                         KeyCode::Char('s') if view == View::Syscalls => {
@@ -111,6 +123,9 @@ fn run_loop(
                     let rows: Vec<(ConnectionKey, ConnectionStats)> =
                         connections.borrow().iter().map(|(&k, &s)| (k, s)).collect();
                     draw_network(terminal, target, start.elapsed(), rows)?;
+                }
+                View::Memory => {
+                    draw_memory(terminal, target, start.elapsed(), cgroup_path)?;
                 }
             }
             last_draw = Instant::now();
@@ -148,7 +163,7 @@ fn draw_syscalls(
         .split(area);
 
         let header_text = format!(
-            "{target}  |  uptime {}s  |  {total_events} syscalls seen  |  sorted by {sort_label} ('s' to toggle, Tab for Network)",
+            "{target}  |  uptime {}s  |  {total_events} syscalls seen  |  sorted by {sort_label} ('s' to toggle, Tab to cycle panels)",
             uptime.as_secs(),
         );
         frame.render_widget(
@@ -233,7 +248,7 @@ fn draw_network(
         .split(area);
 
         let header_text = format!(
-            "{target}  |  uptime {}s  |  {} connections, {retransmitting} retransmitting  |  (Tab for Syscalls)",
+            "{target}  |  uptime {}s  |  {} connections, {retransmitting} retransmitting  |  (Tab to cycle panels)",
             uptime.as_secs(),
             rows.len(),
         );
@@ -294,6 +309,98 @@ fn draw_network(
             ),
             chunks[2],
         );
+    })?;
+
+    Ok(())
+}
+
+/// FR5.3: cgroup memory stats, re-read from cgroupfs on every redraw (already
+/// throttled to `refresh`) rather than tracked incrementally like the other
+/// two panels.
+fn draw_memory(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    target: &str,
+    uptime: Duration,
+    cgroup_path: Option<&str>,
+) -> anyhow::Result<()> {
+    let stats = cgroup_path.map(mem_stats::read);
+
+    terminal.draw(|frame| {
+        let area = frame.area();
+        let chunks = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+        let header_text = format!(
+            "{target}  |  uptime {}s  |  (Tab to cycle panels)",
+            uptime.as_secs(),
+        );
+        frame.render_widget(
+            Paragraph::new(header_text)
+                .block(Block::default().borders(Borders::ALL).title("peekbeam — Memory")),
+            chunks[0],
+        );
+
+        let (table_rows, footer): (Vec<Row>, &str) = match &stats {
+            None => (
+                Vec::new(),
+                "unavailable: couldn't resolve a cgroup for this PID (try --container, or check /proc/<pid>/cgroup)",
+            ),
+            Some(Err(_)) => (
+                Vec::new(),
+                "unavailable: couldn't read memory.current/memory.stat for this cgroup (may have just exited)",
+            ),
+            Some(Ok(s)) => {
+                let rows = vec![
+                    Row::new(vec![
+                        Cell::from("Total (memory.current)"),
+                        Cell::from(mem_stats::format_bytes(s.current_bytes)),
+                        Cell::from("charged to this cgroup: anon + file cache + kernel structures"),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("Anonymous"),
+                        Cell::from(mem_stats::format_bytes(s.anon_bytes)),
+                        Cell::from("heap/stack memory, not backed by a file"),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("File cache"),
+                        Cell::from(mem_stats::format_bytes(s.file_bytes)),
+                        Cell::from("file-backed memory, reclaimable under pressure"),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("Active anon"),
+                        Cell::from(mem_stats::format_bytes(s.active_anon_bytes)),
+                        Cell::from("anon memory used recently, unlikely to be reclaimed soon"),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("Inactive anon"),
+                        Cell::from(mem_stats::format_bytes(s.inactive_anon_bytes)),
+                        Cell::from("anon memory not used recently, first candidate if swap is needed"),
+                    ]),
+                ];
+                (
+                    rows,
+                    "Ctrl+C or 'q' to quit — detaches all probes cleanly. Page faults / alloc rate (FR5.1/5.2) need kernel BTF, not available on this host.",
+                )
+            }
+        };
+
+        let widths = [
+            Constraint::Length(24),
+            Constraint::Length(12),
+            Constraint::Min(30),
+        ];
+
+        let header_style = Style::default().add_modifier(Modifier::BOLD);
+        let table = Table::new(table_rows, widths)
+            .header(Row::new(vec!["Metric", "Value", "What it means"]).style(header_style))
+            .block(Block::default().borders(Borders::ALL));
+
+        frame.render_widget(table, chunks[1]);
+        frame.render_widget(Paragraph::new(footer), chunks[2]);
     })?;
 
     Ok(())

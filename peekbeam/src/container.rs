@@ -11,21 +11,17 @@ use std::{fs, os::unix::fs::MetadataExt, path::Path, process::Command};
 
 use anyhow::{Context, anyhow};
 
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 pub struct ContainerTarget {
     pub cgroup_id: u64,
     pub full_id: String,
+    /// Path under `CGROUP_ROOT`, e.g. `/system.slice/docker-<id>.scope`. Also
+    /// backs FR5.3 (cgroup memory.current/memory.stat reads).
+    pub cgroup_path: String,
 }
 
 pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
-    if !Path::new(CGROUP_ROOT).join("cgroup.controllers").exists() {
-        return Err(anyhow!(
-            "--container needs the unified cgroup v2 hierarchy (no cgroup.controllers \
-             under {CGROUP_ROOT}); cgroup v1 hosts aren't supported yet"
-        ));
-    }
-
     let output = docker_command()
         .args(["inspect", "--format", "{{.State.Pid}}|{{.Id}}", id_or_name])
         .output()
@@ -53,7 +49,7 @@ pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
         ));
     }
 
-    let cgroup_path = resolve_cgroup_path(pid)?;
+    let cgroup_path = cgroup_path_for_pid(pid)?;
     let full_path = format!("{CGROUP_ROOT}{cgroup_path}");
     let metadata =
         fs::metadata(&full_path).with_context(|| format!("statting cgroup path {full_path}"))?;
@@ -61,6 +57,7 @@ pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
     Ok(ContainerTarget {
         cgroup_id: metadata.ino(),
         full_id: full_id.trim().to_string(),
+        cgroup_path,
     })
 }
 
@@ -84,9 +81,18 @@ fn docker_command() -> Command {
 }
 
 /// Reads `/proc/<pid>/cgroup` and returns the unified (v2) cgroup path, e.g.
-/// `/system.slice/docker-<id>.scope`. This covers every process in the
-/// container (init, workers, ...), unlike resolving a single PID.
-fn resolve_cgroup_path(pid: u32) -> anyhow::Result<String> {
+/// `/system.slice/docker-<id>.scope`. For a container this covers every
+/// process in it (init, workers, ...), not just a single PID; also used
+/// directly for `--pid` mode to back FR5.3 (cgroup memory stats), when that
+/// PID's cgroup can be resolved at all.
+pub fn cgroup_path_for_pid(pid: u32) -> anyhow::Result<String> {
+    if !Path::new(CGROUP_ROOT).join("cgroup.controllers").exists() {
+        return Err(anyhow!(
+            "needs the unified cgroup v2 hierarchy (no cgroup.controllers under \
+             {CGROUP_ROOT}); cgroup v1 hosts aren't supported yet"
+        ));
+    }
+
     let contents = fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .with_context(|| format!("reading /proc/{pid}/cgroup"))?;
 

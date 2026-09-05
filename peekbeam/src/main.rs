@@ -17,6 +17,7 @@ use log::debug;
 use peekbeam_common::{EventKind, NetEvent, NetEventKind, SyscallEvent, TCP_CLOSE};
 
 mod container;
+mod mem_stats;
 mod net_table;
 mod syscall_table;
 mod tui;
@@ -40,17 +41,27 @@ struct Args {
 }
 
 enum Target {
-    Pid(u32),
+    Pid { pid: u32, cgroup_path: Option<String> },
     Container(container::ContainerTarget),
 }
 
 impl Target {
     fn label(&self) -> String {
         match self {
-            Target::Pid(pid) => format!("PID {pid}"),
+            Target::Pid { pid, .. } => format!("PID {pid}"),
             Target::Container(c) => {
                 format!("container {} (cgroup {})", &c.full_id[..12.min(c.full_id.len())], c.cgroup_id)
             }
+        }
+    }
+
+    /// Path under `container::CGROUP_ROOT`, if resolvable, for FR5.3 (memory
+    /// panel). Always present for `--container`; for `--pid` it depends on
+    /// whether that PID's own cgroup could be read.
+    fn cgroup_path(&self) -> Option<&str> {
+        match self {
+            Target::Pid { cgroup_path, .. } => cgroup_path.as_deref(),
+            Target::Container(c) => Some(&c.cgroup_path),
         }
     }
 }
@@ -142,7 +153,8 @@ fn main() -> anyhow::Result<()> {
 
     let target = if let Some(pid) = args.pid {
         check_target_exists(pid)?;
-        Target::Pid(pid)
+        let cgroup_path = container::cgroup_path_for_pid(pid).ok();
+        Target::Pid { pid, cgroup_path }
     } else if let Some(container_id) = args.container.as_deref() {
         Target::Container(container::resolve(container_id)?)
     } else {
@@ -159,7 +171,7 @@ fn main() -> anyhow::Result<()> {
     .context("loading eBPF bytecode")?;
 
     match &target {
-        Target::Pid(pid) => {
+        Target::Pid { pid, .. } => {
             let mut pid_filter: BpfHashMap<_, u32, u8> = BpfHashMap::try_from(
                 ebpf.map_mut("PID_FILTER")
                     .context("PID_FILTER map not found in eBPF object")?,
@@ -272,8 +284,12 @@ fn main() -> anyhow::Result<()> {
         drain_net_events();
     };
 
+    let label = target.label();
+    let cgroup_path = target.cgroup_path().map(str::to_string);
+
     tui::run(
-        target.label(),
+        label,
+        cgroup_path,
         Duration::from_millis(args.refresh_ms),
         stats,
         connections,
