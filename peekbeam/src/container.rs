@@ -26,7 +26,7 @@ pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
         ));
     }
 
-    let output = Command::new("docker")
+    let output = docker_command()
         .args(["inspect", "--format", "{{.State.Pid}}|{{.Id}}", id_or_name])
         .output()
         .context("running `docker inspect` (is Docker installed and on PATH?)")?;
@@ -62,6 +62,25 @@ pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
         cgroup_id: metadata.ino(),
         full_id: full_id.trim().to_string(),
     })
+}
+
+/// Builds the `docker` invocation, pointed at the right daemon socket even when
+/// peekbeam itself runs as root via `sudo`. `sudo` drops the invoking user's
+/// `DOCKER_HOST`, so a rootless Docker install (common; this project's own dev
+/// host uses one) would otherwise have root's `docker` CLI silently query a
+/// different, unrelated daemon and report "no such object" for a container
+/// that is, in fact, running.
+fn docker_command() -> Command {
+    let mut cmd = Command::new("docker");
+    if std::env::var_os("DOCKER_HOST").is_none() {
+        if let Some(uid) = std::env::var("SUDO_UID").ok().and_then(|s| s.parse::<u32>().ok()) {
+            let socket = format!("/run/user/{uid}/docker.sock");
+            if Path::new(&socket).exists() {
+                cmd.env("DOCKER_HOST", format!("unix://{socket}"));
+            }
+        }
+    }
+    cmd
 }
 
 /// Reads `/proc/<pid>/cgroup` and returns the unified (v2) cgroup path, e.g.
