@@ -52,3 +52,54 @@ pub enum NetEventKind {
 pub const AF_INET: u16 = 2;
 pub const AF_INET6: u16 = 10;
 pub const TCP_CLOSE: u16 = 7;
+
+/// File access event layout (FR4), built from `raw_syscalls:sys_enter`/`sys_exit`
+/// for a handful of syscall numbers (openat/openat2/close/read/write/pread64/
+/// pwrite64) rather than new hook points — no kernel struct access needed, so
+/// no BTF/CO-RE dependency, matching every other hook in this project.
+///
+/// `path`/`path_len` are only populated for `Open`; `peekbeam` builds its own
+/// `(pid, fd) -> path` table from `Open` events so `Read`/`Write`/`Close`
+/// (which only carry `fd`) can still be attributed to a file (FR4.2).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FileEvent {
+    pub pid: u32,
+    pub kind: FileEventKind,
+    pub fd: i32,
+    pub bytes: i64,
+    pub path_len: u16,
+    pub path: [u8; FILE_PATH_MAX],
+    pub timestamp_ns: u64,
+}
+
+pub const FILE_PATH_MAX: usize = 64;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileEventKind {
+    Open = 0,
+    Close = 1,
+    Read = 2,
+    Write = 3,
+}
+
+/// Memory allocation event layout (FR5.1), from the `kmem:kmalloc`/`kmem:kfree`
+/// tracepoints — stable scalar fields, no BTF/CO-RE needed (unlike a raw
+/// `struct sock`/`struct file` read, these tracepoints' own format already
+/// exposes `bytes_alloc` etc. as plain integers).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct MemEvent {
+    pub pid: u32,
+    pub kind: MemEventKind,
+    pub bytes: u64,
+    pub timestamp_ns: u64,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemEventKind {
+    Alloc = 0,
+    Free = 1,
+}

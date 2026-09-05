@@ -17,6 +17,9 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 ratatui = { workspace = true, features = ["crossterm"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+signal-hook = { workspace = true }
 syscalls = { workspace = true }
 
 [build-dependencies]

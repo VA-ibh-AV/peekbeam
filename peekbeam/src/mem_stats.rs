@@ -137,6 +137,52 @@ fn read_processes(pids: &[u32]) -> anyhow::Result<MemReport> {
     })
 }
 
+/// FR5.2: minor/major page fault counts, since each process started (not since
+/// peekbeam attached) — read from `/proc/<pid>/stat` fields 10/12 (`minflt`/
+/// `majflt`), summed like the `/proc`-based memory fallback. No raw
+/// `exceptions:page_fault_user`-style tracepoint exists on this arm64 kernel
+/// (that category is x86-specific; confirmed absent here), but this needs no
+/// tracepoint or BTF at all.
+#[derive(Clone, Copy, Default)]
+pub struct FaultStats {
+    pub min_flt: u64,
+    pub maj_flt: u64,
+}
+
+pub fn read_faults(target: &MemoryTarget) -> anyhow::Result<FaultStats> {
+    let pids = match target {
+        MemoryTarget::Pid(pid) => vec![*pid],
+        MemoryTarget::Cgroup(path) => read_cgroup_procs(path)?,
+    };
+
+    let mut stats = FaultStats::default();
+    let mut found_any = false;
+    for pid in pids {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // Fields after `pid (comm) state ...` are space-separated, but `comm`
+        // itself may contain spaces/parens, so split after the last ')'.
+        let Some(after_comm) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+            continue;
+        };
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // `state` is field 3 in the full record and is `fields[0]` here, so
+        // `minflt` (field 10) is `fields[7]`, `majflt` (field 12) is `fields[9]`.
+        let (Some(min_flt), Some(maj_flt)) = (fields.get(7), fields.get(9)) else {
+            continue;
+        };
+        stats.min_flt += min_flt.parse().unwrap_or(0);
+        stats.maj_flt += maj_flt.parse().unwrap_or(0);
+        found_any = true;
+    }
+
+    if !found_any {
+        return Err(anyhow!("no live processes found (target may have exited)"));
+    }
+    Ok(stats)
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;

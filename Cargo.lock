@@ -577,6 +577,9 @@ dependencies = [
  "peekbeam-common",
  "peekbeam-ebpf",
  "ratatui",
+ "serde",
+ "serde_json",
+ "signal-hook",
  "syscalls",
 ]
 

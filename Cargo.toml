@@ -31,6 +31,9 @@ caps = { version = "0.5", default-features = false }
 syscalls = { version = "0.6", default-features = false }
 ratatui = { version = "0.29", default-features = false }
 crossterm = { version = "0.28", default-features = false }
+signal-hook = { version = "0.3", default-features = false }
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false }
 
 [profile.release.package.peekbeam-ebpf]
 debug = 2

@@ -43,10 +43,16 @@ pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
     let pid: u32 = pid_str
         .parse()
         .with_context(|| format!("parsing container PID from docker inspect: {pid_str:?}"))?;
+
+    from_pid(pid, full_id.trim().to_string())
+}
+
+/// Resolves a container from its runtime-reported PID directly, skipping the
+/// docker-inspect step. Used by [`resolve`] itself, and by `pod`'s containerd
+/// path (via `crictl inspect`, which also gives a PID).
+pub fn from_pid(pid: u32, full_id: String) -> anyhow::Result<ContainerTarget> {
     if pid == 0 {
-        return Err(anyhow!(
-            "container `{id_or_name}` is not running (docker reports PID 0)"
-        ));
+        return Err(anyhow!("container `{full_id}` is not running (runtime reports PID 0)"));
     }
 
     let cgroup_path = cgroup_path_for_pid(pid)?;
@@ -56,7 +62,7 @@ pub fn resolve(id_or_name: &str) -> anyhow::Result<ContainerTarget> {
 
     Ok(ContainerTarget {
         cgroup_id: metadata.ino(),
-        full_id: full_id.trim().to_string(),
+        full_id,
         cgroup_path,
     })
 }
