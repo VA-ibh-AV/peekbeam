@@ -41,27 +41,26 @@ struct Args {
 }
 
 enum Target {
-    Pid { pid: u32, cgroup_path: Option<String> },
+    Pid(u32),
     Container(container::ContainerTarget),
 }
 
 impl Target {
     fn label(&self) -> String {
         match self {
-            Target::Pid { pid, .. } => format!("PID {pid}"),
+            Target::Pid(pid) => format!("PID {pid}"),
             Target::Container(c) => {
                 format!("container {} (cgroup {})", &c.full_id[..12.min(c.full_id.len())], c.cgroup_id)
             }
         }
     }
 
-    /// Path under `container::CGROUP_ROOT`, if resolvable, for FR5.3 (memory
-    /// panel). Always present for `--container`; for `--pid` it depends on
-    /// whether that PID's own cgroup could be read.
-    fn cgroup_path(&self) -> Option<&str> {
+    /// FR5.3 (memory panel): for `--pid`, that process's own memory, not
+    /// whatever else happens to share its cgroup.
+    fn memory_target(&self) -> mem_stats::MemoryTarget {
         match self {
-            Target::Pid { cgroup_path, .. } => cgroup_path.as_deref(),
-            Target::Container(c) => Some(&c.cgroup_path),
+            Target::Pid(pid) => mem_stats::MemoryTarget::Pid(*pid),
+            Target::Container(c) => mem_stats::MemoryTarget::Cgroup(c.cgroup_path.clone()),
         }
     }
 }
@@ -153,8 +152,7 @@ fn main() -> anyhow::Result<()> {
 
     let target = if let Some(pid) = args.pid {
         check_target_exists(pid)?;
-        let cgroup_path = container::cgroup_path_for_pid(pid).ok();
-        Target::Pid { pid, cgroup_path }
+        Target::Pid(pid)
     } else if let Some(container_id) = args.container.as_deref() {
         Target::Container(container::resolve(container_id)?)
     } else {
@@ -171,7 +169,7 @@ fn main() -> anyhow::Result<()> {
     .context("loading eBPF bytecode")?;
 
     match &target {
-        Target::Pid { pid, .. } => {
+        Target::Pid(pid) => {
             let mut pid_filter: BpfHashMap<_, u32, u8> = BpfHashMap::try_from(
                 ebpf.map_mut("PID_FILTER")
                     .context("PID_FILTER map not found in eBPF object")?,
@@ -285,11 +283,11 @@ fn main() -> anyhow::Result<()> {
     };
 
     let label = target.label();
-    let cgroup_path = target.cgroup_path().map(str::to_string);
+    let memory_target = target.memory_target();
 
     tui::run(
         label,
-        cgroup_path,
+        memory_target,
         Duration::from_millis(args.refresh_ms),
         stats,
         connections,

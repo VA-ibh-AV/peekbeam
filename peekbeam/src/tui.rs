@@ -39,7 +39,7 @@ enum SortBy {
 /// no eBPF probes are left attached to a hung terminal session.
 pub fn run(
     target: String,
-    cgroup_path: Option<String>,
+    memory_target: mem_stats::MemoryTarget,
     refresh: Duration,
     stats: StatsMap,
     connections: ConnMap,
@@ -54,7 +54,7 @@ pub fn run(
     let result = run_loop(
         &mut terminal,
         &target,
-        cgroup_path.as_deref(),
+        &memory_target,
         refresh,
         stats,
         connections,
@@ -71,7 +71,7 @@ pub fn run(
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     target: &str,
-    cgroup_path: Option<&str>,
+    memory_target: &mem_stats::MemoryTarget,
     refresh: Duration,
     stats: StatsMap,
     connections: ConnMap,
@@ -125,7 +125,7 @@ fn run_loop(
                     draw_network(terminal, target, start.elapsed(), rows)?;
                 }
                 View::Memory => {
-                    draw_memory(terminal, target, start.elapsed(), cgroup_path)?;
+                    draw_memory(terminal, target, start.elapsed(), memory_target)?;
                 }
             }
             last_draw = Instant::now();
@@ -321,9 +321,9 @@ fn draw_memory(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     target: &str,
     uptime: Duration,
-    cgroup_path: Option<&str>,
+    memory_target: &mem_stats::MemoryTarget,
 ) -> anyhow::Result<()> {
-    let stats = cgroup_path.map(mem_stats::read);
+    let report = mem_stats::read(memory_target);
 
     terminal.draw(|frame| {
         let area = frame.area();
@@ -344,46 +344,82 @@ fn draw_memory(
             chunks[0],
         );
 
-        let (table_rows, footer): (Vec<Row>, &str) = match &stats {
-            None => (
+        let (table_rows, footer): (Vec<Row>, &str) = match &report {
+            Err(_) => (
                 Vec::new(),
-                "unavailable: couldn't resolve a cgroup for this PID (try --container, or check /proc/<pid>/cgroup)",
+                "unavailable: no live processes found for this target (may have exited)",
             ),
-            Some(Err(_)) => (
-                Vec::new(),
-                "unavailable: couldn't read memory.current/memory.stat for this cgroup (may have just exited)",
-            ),
-            Some(Ok(s)) => {
+            Ok(mem_stats::MemReport::Cgroup {
+                current_bytes,
+                anon_bytes,
+                file_bytes,
+                active_anon_bytes,
+                inactive_anon_bytes,
+            }) => {
                 let rows = vec![
                     Row::new(vec![
                         Cell::from("Total (memory.current)"),
-                        Cell::from(mem_stats::format_bytes(s.current_bytes)),
+                        Cell::from(mem_stats::format_bytes(*current_bytes)),
                         Cell::from("charged to this cgroup: anon + file cache + kernel structures"),
                     ]),
                     Row::new(vec![
                         Cell::from("Anonymous"),
-                        Cell::from(mem_stats::format_bytes(s.anon_bytes)),
+                        Cell::from(mem_stats::format_bytes(*anon_bytes)),
                         Cell::from("heap/stack memory, not backed by a file"),
                     ]),
                     Row::new(vec![
                         Cell::from("File cache"),
-                        Cell::from(mem_stats::format_bytes(s.file_bytes)),
+                        Cell::from(mem_stats::format_bytes(*file_bytes)),
                         Cell::from("file-backed memory, reclaimable under pressure"),
                     ]),
                     Row::new(vec![
                         Cell::from("Active anon"),
-                        Cell::from(mem_stats::format_bytes(s.active_anon_bytes)),
+                        Cell::from(mem_stats::format_bytes(*active_anon_bytes)),
                         Cell::from("anon memory used recently, unlikely to be reclaimed soon"),
                     ]),
                     Row::new(vec![
                         Cell::from("Inactive anon"),
-                        Cell::from(mem_stats::format_bytes(s.inactive_anon_bytes)),
+                        Cell::from(mem_stats::format_bytes(*inactive_anon_bytes)),
                         Cell::from("anon memory not used recently, first candidate if swap is needed"),
                     ]),
                 ];
                 (
                     rows,
-                    "Ctrl+C or 'q' to quit — detaches all probes cleanly. Page faults / alloc rate (FR5.1/5.2) need kernel BTF, not available on this host.",
+                    "Source: cgroup memory controller. Page faults / alloc rate (FR5.1/5.2) need kernel BTF, not available on this host.",
+                )
+            }
+            Ok(mem_stats::MemReport::Process {
+                rss_bytes,
+                anon_bytes,
+                file_bytes,
+                shmem_bytes,
+                num_processes,
+            }) => {
+                let rows = vec![
+                    Row::new(vec![
+                        Cell::from("RSS (VmRSS)"),
+                        Cell::from(mem_stats::format_bytes(*rss_bytes)),
+                        Cell::from(format!("resident memory summed across {num_processes} process(es)")),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("Anonymous"),
+                        Cell::from(mem_stats::format_bytes(*anon_bytes)),
+                        Cell::from("heap/stack memory, not backed by a file"),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("File-backed"),
+                        Cell::from(mem_stats::format_bytes(*file_bytes)),
+                        Cell::from("mapped/cached file pages, reclaimable under pressure"),
+                    ]),
+                    Row::new(vec![
+                        Cell::from("Shared"),
+                        Cell::from(mem_stats::format_bytes(*shmem_bytes)),
+                        Cell::from("shared memory (tmpfs, shm segments)"),
+                    ]),
+                ];
+                (
+                    rows,
+                    "Source: /proc/<pid>/status (cgroup memory controller not delegated on this host). Page faults / alloc rate (FR5.1/5.2) need kernel BTF, not available on this host.",
                 )
             }
         };
